@@ -1,0 +1,256 @@
+"""Uniform case schema for the empirical coverage measurement (paper 2).
+
+The modeled scorecard (demo/scorecard.py) scores eight synthetic drains against a
+capability ladder we *model*. The measurement extends that: it runs a corpus of
+cases past REAL deployed defenses (demo/measure.py) and records which defense
+catches which drain. Two case sources feed those defenses:
+
+  - synthetic: derived from the deterministic attack suite (demo/attacks.py), run
+    on the local anvil chain. These cover the edge cases real corpora
+    under-sample (EIP-7702 delegation, Permit2 SignatureTransfer, honeypot/TOCTOU
+    armed after simulation). They carry ground-truth context (is the counterparty
+    a contract, is it allowlisted) computed from the chain, so an open-rule
+    defense can be evaluated against them faithfully.
+  - real: labeled on-chain drainer / phishing transactions loaded from
+    corpus/real/*.json. These are replayed against hosted defenses (Tenderly,
+    GoPlus) that see real mainnet state. NOTE: this repo ships the loader and the
+    schema, not a bundled dataset; populate corpus/real/ from a labeled source
+    (e.g. the PTXPHISH release, arXiv 2409.02386, or on-chain-labelled drainer
+    txns) before the hosted-defense measurement is meaningful.
+
+A Case carries enough to (a) present the artifact to a real defense and (b) know
+ground truth, so each verdict can be scored catch / miss / blind.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+from dataclasses import asdict, dataclass, field
+
+from . import cast, reviewers
+from .attacks import ATTACKS, MAX_DEC
+from .chain import Chain
+
+REAL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "corpus", "real"
+)
+MAXV = int(MAX_DEC)
+
+
+@dataclass
+class Case:
+    id: str
+    source: str                     # "synthetic" | "real"
+    label: str                      # ground-truth category (e.g. approval-drain, permit-phish, benign)
+    malicious: bool                 # ground truth: is this actually a drain?
+    kind: str                       # "onchain" | "offchain_sig"
+    action_type: str                # approve|transfer|call|permit|order|delegation|permit2_approve
+    chain_id: int = 1
+
+    # the concrete artifact, for a hosted defense to inspect:
+    frm: str = ""                   # signer / sender (the owner whose funds are at risk)
+    to: str = ""                    # tx target (on-chain) or verifying contract (off-chain sig)
+    input: str = ""                 # calldata (on-chain); "" for an off-chain signature (no tx)
+    value: str = "0"                # wei value
+
+    # decoded semantics + ground-truth context, as a clear-signer / rule engine sees:
+    counterparty: str = ""
+    recipient: str = ""
+    amount: str = "0"               # token amount as a decimal string, or "UNLIMITED" / "account"
+    counterparty_is_contract: bool = False
+    recipient_is_contract: bool = False
+    counterparty_known: bool = False   # allowlisted / known-good target
+    recipient_known: bool = False
+
+    # real cases only:
+    tx_hash: str = ""
+    block: int = 0
+    note: str = ""
+
+    @property
+    def unlimited(self) -> bool:
+        return self.amount == "UNLIMITED" or (self.amount.isdigit() and int(self.amount) >= MAXV)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _amount_str(atype: str, amount: int) -> str:
+    if atype == "delegation":
+        return "account"
+    return "UNLIMITED" if amount >= MAXV else str(amount)
+
+
+def synthetic_cases(chain: Chain) -> list[Case]:
+    """Build a Case per attack, on the live anvil chain, with ground-truth context
+    (contract-vs-EOA, allowlisted-or-not) read from the chain. Mirrors the per-attack
+    setup in scorecard.run so the artifacts are the real ones the attacks produce."""
+    known = chain.allowlist_addrs  # bound method
+    cases: list[Case] = []
+    for atk in ATTACKS:
+        chain.extra_allowlist = set()
+        chain.deploy_usdc()
+        chain.mint("agent", 1_000_000)
+
+        action = atk.build(chain)
+        atype, counterparty, recipient, amount = reviewers._decode(action, chain)
+        allow = known(reviewers.ALLOWLIST_ROLES)
+
+        to = action.to or chain.usdc
+        cases.append(Case(
+            id=atk.id,
+            source="synthetic",
+            label=atype,
+            malicious=True,
+            kind=action.kind,
+            action_type=atype,
+            chain_id=31337,
+            frm=chain.addr("agent"),
+            to=to,
+            input=action.calldata,          # "" for off-chain signatures
+            value="0",
+            counterparty=counterparty,
+            recipient=recipient,
+            amount=_amount_str(atype, amount),
+            counterparty_is_contract=cast.has_code(chain.rpc, counterparty),
+            recipient_is_contract=cast.has_code(chain.rpc, recipient),
+            counterparty_known=counterparty.lower() in allow,
+            recipient_known=recipient.lower() in allow,
+            note=atk.true_effect,
+        ))
+    return cases
+
+
+# --- constructed pending simulator suite -----------------------------------
+# Real calldata to real mainnet contracts, simulated live at latest state. This
+# is the substrate the pre-sign simulator tier is measured on: a latest-state
+# simulator cannot replay executed history, so drains are posed as pending
+# transactions (what an agent is about to sign), which is what the simulator is
+# built to inspect. Same taxonomy as the synthetic suite, real addresses.
+USDC_MAINNET = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+UNIVERSAL_ROUTER = "0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af"
+WHALE = "0x28C6c06298d514Db089934071355E5743bf21d60"          # a large USDC holder (funds the transfer sim)
+STRANGER = "0x90F79bf6EB2c4f870365E785982E1f101E93b906"        # a fresh EOA standing in for the attacker
+KNOWN_MERCHANT = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"  # an allowlisted payee
+
+
+def _constructed(cid, atype, calldata, cp, amount, cp_contract, cp_known, malicious) -> Case:
+    return Case(
+        id=cid, source="constructed", label=atype, malicious=malicious, kind="onchain",
+        action_type=atype, chain_id=1, frm=WHALE, to=USDC_MAINNET, input=calldata,
+        counterparty=cp, recipient=cp, amount=amount,
+        counterparty_is_contract=cp_contract, recipient_is_contract=cp_contract,
+        counterparty_known=cp_known, recipient_known=cp_known,
+        note="constructed pending drain: real calldata to real mainnet contracts",
+    )
+
+
+# Real opaque payable-drainer contracts (PTXPHISH payable-wallet / payable-airdrop
+# columns): a selector-only call whose payload a field rule cannot decode, but
+# whose ETH outflow a simulator sees. Posed here as a pending call from a funded
+# account (the whale), which is the pre-sign scenario the simulator is built for.
+PAYABLE_WALLET_DRAINER = "0x2b82e507084b2d2dd877af237ad4720e028acfd0"    # sel 0x5fba79f5
+PAYABLE_AIRDROP_DRAINER = "0xa3ea2372bdc3663082cce0f84e185125cca814f6"   # sel 0x3158952e
+
+
+# A real proxy-upgrade drain (PTXPHISH proxy-upgrade column): the owner signs
+# upgradeTo(fresh malicious implementation). Simulated from the real owner so the
+# call does not revert. The upgrade moves no funds, so a latest-state simulator
+# sees no adverse change; the drain is a later call into the new implementation.
+PROXY_OWNER = "0x5444c883aa97d419ac20dcdbd7767f632b1a7669"
+PROXY_ADDR = "0xdfda474da220e477ed6111e3e55f7fe1c8ad64ef"
+PROXY_INPUT = "0x3659cfe6000000000000000000000000fc48255bff44906c8ab25ccfdb15e2fed953084a"
+PROXY_IMPL = "0xfc48255bfF44906c8Ab25CCFdB15e2FED953084A"
+
+
+def _proxy_upgrade_case() -> Case:
+    return Case(
+        id="c-proxy-upgrade", source="constructed", label="proxy-upgrade", malicious=True,
+        kind="onchain", action_type="call", chain_id=1, frm=PROXY_OWNER, to=PROXY_ADDR,
+        input=PROXY_INPUT, value="0", counterparty=PROXY_IMPL, recipient=PROXY_IMPL,
+        amount="account", counterparty_is_contract=True, recipient_is_contract=True,
+        counterparty_known=False, recipient_known=False,
+        note="constructed pending proxy upgrade to a fresh implementation: no asset change at "
+             "signing (simulator blind to the deferred drain), fresh impl (reputation blind).",
+    )
+
+
+def _offchain_sig(cid, atype, cp, amount, cp_contract, malicious) -> Case:
+    """A signed message, no transaction at signing time. The simulator is blind
+    (nothing to simulate), while a field rule / reputation lookup reads the decoded
+    message fields (spender, order recipient). Fills the off-chain classes (EIP-2612
+    permit, Seaport/Blur order) that leave no on-chain grant to recover."""
+    return Case(
+        id=cid, source="constructed", label=atype, malicious=malicious, kind="offchain_sig",
+        action_type=atype, chain_id=1, frm=WHALE, to=USDC_MAINNET, input="", value="0",
+        counterparty=cp, recipient=cp, amount=amount,
+        counterparty_is_contract=cp_contract, recipient_is_contract=cp_contract,
+        counterparty_known=False, recipient_known=False,
+        note="constructed off-chain signature (no tx at signing): simulator blind, field tiers read the message fields",
+    )
+
+
+def _opaque_payable(cid, to, selector, value_wei, malicious) -> Case:
+    return Case(
+        id=cid, source="constructed", label="payable-call", malicious=malicious, kind="onchain",
+        action_type="call", chain_id=1, frm=WHALE, to=to, input=selector, value=str(value_wei),
+        counterparty="", recipient="", amount="0",
+        counterparty_is_contract=True, recipient_is_contract=True,
+        counterparty_known=False, recipient_known=False,
+        note="constructed pending opaque payable drain: a selector-only call that moves the "
+             "signer's ETH. Field rules see no decodable counterparty; a simulator sees the outflow.",
+    )
+
+
+def constructed_sim_cases() -> list[Case]:
+    """A small, fixed suite (real calldata, encoded offline). Kept tiny on purpose:
+    the simulator is PAYG, and demo/alchemy.py caches every response, so this
+    costs a handful of live calls once and nothing thereafter."""
+    m = MAX_DEC
+    ap = lambda spender, amt: cast.calldata("approve(address,uint256)", spender, amt)
+    tr = lambda to, amt: cast.calldata("transfer(address,uint256)", to, amt)
+    one_eth = 10 ** 18
+    return [
+        _constructed("c-approve-unlimited-stranger", "approve", ap(STRANGER, m), STRANGER, "UNLIMITED", False, False, True),
+        _constructed("c-transfer-stranger", "transfer", tr(STRANGER, "1000000"), STRANGER, "1000000", False, False, True),
+        _constructed("c-approve-unlimited-router", "approve", ap(UNIVERSAL_ROUTER, m), UNIVERSAL_ROUTER, "UNLIMITED", True, True, True),
+        # The max approve to the canonical Permit2 contract is BENIGN in isolation
+        # (every Uniswap user signs it); all tiers correctly pass it. The harm is a
+        # LATER Permit2 signature, a separate signing event we do not measure. This
+        # is the deferred-harm enabler, not itself a drain, so its truth is benign.
+        _constructed("c-permit2-approve", "permit2_approve", ap(PERMIT2, m), PERMIT2, "UNLIMITED", True, True, False),
+        _constructed("c-benign-approve-router", "approve", ap(UNIVERSAL_ROUTER, "1000000"), UNIVERSAL_ROUTER, "1000000", True, True, False),
+        _constructed("c-benign-transfer-known", "transfer", tr(KNOWN_MERCHANT, "1000000"), KNOWN_MERCHANT, "1000000", False, True, False),
+        # opaque payable drains: no decodable counterparty, but a simulator sees the
+        # ETH leave, reputation can look up the tx `to`, and a rule flags the value.
+        _opaque_payable("c-opaque-payable-wallet", PAYABLE_WALLET_DRAINER, "0x5fba79f5", one_eth, True),
+        _opaque_payable("c-opaque-payable-airdrop", PAYABLE_AIRDROP_DRAINER, "0x3158952e", one_eth, True),
+        # benign payable control: a legitimate ETH wrap (WETH deposit). It exercises
+        # the same opaque-value path as the drains, so it exposes the false-positive
+        # surface of the value rule and the asset-change heuristic.
+        _opaque_payable("c-benign-payable-weth", WETH, "0xd0e30db0", one_eth, False),
+        # off-chain signature classes: simulator blind, field tiers read the fields.
+        _offchain_sig("c-permit-stranger", "permit", STRANGER, "UNLIMITED", False, True),
+        _offchain_sig("c-order-stranger", "order", STRANGER, "0", False, True),
+        # deferred-harm proxy upgrade: no asset change at signing, fresh impl.
+        _proxy_upgrade_case(),
+    ]
+
+
+def real_cases() -> list[Case]:
+    """Load labeled real transactions from corpus/real/*.json. Each file is a JSON
+    list of objects matching the Case fields (extra keys are ignored). Missing =
+    empty list, which is fine until a dataset is dropped in."""
+    out: list[Case] = []
+    for path in sorted(glob.glob(os.path.join(REAL_DIR, "*.json"))):
+        with open(path) as f:
+            records = json.load(f)
+        for rec in records:
+            fields = {k: rec[k] for k in rec if k in Case.__dataclass_fields__}
+            fields.setdefault("source", "real")
+            out.append(Case(**fields))
+    return out
